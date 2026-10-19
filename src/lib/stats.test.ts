@@ -216,3 +216,32 @@ describe("日均", () => {
     expect(st.avgPerDay).toBe(30); // 90 分钟 / 3 天，而不是 /7
   });
 });
+
+describe("时段与星期维度", () => {
+  // 周报会同时引用总量和「几点学得最多」「周几最少」，两者必须能对上
+  const s = session({
+    id: "hh1",
+    startAt: at("2026-10-18T23:40:00+08:00"),
+    endAt: at("2026-10-19T00:20:00+08:00"),
+  });
+  const segs: SessionSegment[] = [
+    { sessionId: "hh1", kind: "work", startAt: at("2026-10-18T23:40:00+08:00"), endAt: at("2026-10-18T23:50:00+08:00"), pauseReasonId: null },
+    { sessionId: "hh1", kind: "break", startAt: at("2026-10-18T23:50:00+08:00"), endAt: at("2026-10-18T23:55:00+08:00"), pauseReasonId: "r1" },
+    { sessionId: "hh1", kind: "work", startAt: at("2026-10-18T23:55:00+08:00"), endAt: at("2026-10-19T00:20:00+08:00"), pauseReasonId: null },
+  ];
+
+  it("小时直方图合计等于净时长，跨零点的分钟归到各自的钟点", () => {
+    const st = run([s], segs, "total", at("2026-10-19T12:00:00+08:00"));
+    expect(st.hourHistogram.reduce((a, b) => a + b, 0)).toBe(st.totalMinutes);
+    expect(st.hourHistogram[23]).toBe(15); // 23:40-23:50 + 23:55-24:00
+    expect(st.hourHistogram[0]).toBe(20); // 00:00-00:20
+  });
+
+  it("星期分布合计等于净时长，跨零点的那段算给第二天", () => {
+    const st = run([s], segs, "total", at("2026-10-19T12:00:00+08:00"));
+    expect(st.weekdayMinutes.reduce((a, b) => a + b, 0)).toBe(st.totalMinutes);
+    // 10-18 是周日（index 6），10-19 是周一（index 0）
+    expect(st.weekdayMinutes[6]).toBe(15);
+    expect(st.weekdayMinutes[0]).toBe(20);
+  });
+});

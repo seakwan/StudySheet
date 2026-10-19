@@ -129,12 +129,12 @@ const workSpans = (segments: SessionSegment[], now: number, capAt: number | null
  * 补录的记录没有事件流，整段 startAt→endAt 视为一段 work —— 否则补录
  * 在图表里会完全消失，而今日列表又能看到它，两处数字对不上。
  */
-function attributeByDay(
+function attributedSpans(
   session: StudySession,
   segments: SessionSegment[],
   range: DayRange,
   now: number,
-): Array<{ day: string; ms: number }> {
+): Array<{ start: number; end: number }> {
   const spans = workSpans(segments, now, session.endAt ?? null);
   const effective =
     spans.length > 0
@@ -142,19 +142,51 @@ function attributeByDay(
       : session.endAt
         ? [{ start: session.startAt, end: session.endAt }]
         : [];
+  return effective
+    .map((s) => ({ start: Math.max(s.start, range.from), end: Math.min(s.end, range.to) }))
+    .filter((s) => s.end > s.start);
+}
 
+function attributeByDay(
+  session: StudySession,
+  segments: SessionSegment[],
+  range: DayRange,
+  now: number,
+): Array<{ day: string; ms: number }> {
   const out: Array<{ day: string; ms: number }> = [];
-  for (const span of effective) {
-    const stopAll = Math.min(span.end, range.to);
-    let cursor = Math.max(span.start, range.from);
-    while (cursor < stopAll) {
-      const stop = Math.min(stopAll, addDays(midnight(cursor), 1));
+  for (const span of attributedSpans(session, segments, range, now)) {
+    let cursor = span.start;
+    while (cursor < span.end) {
+      const stop = Math.min(span.end, addDays(midnight(cursor), 1));
       out.push({ day: dayKey(cursor), ms: stop - cursor });
       cursor = stop;
     }
   }
   return out;
 }
+
+/** 把时间区间按本地整点切开，用于统计「几点钟学得最多」。 */
+function splitByHour(start: number, end: number): Array<{ hour: number; ms: number }> {
+  const out: Array<{ hour: number; ms: number }> = [];
+  let cursor = start;
+  while (cursor < end) {
+    const d = new Date(cursor);
+    const nextHour = new Date(d.getFullYear(), d.getMonth(), d.getDate(), d.getHours() + 1).getTime();
+    const stop = Math.min(end, nextHour);
+    out.push({ hour: d.getHours(), ms: stop - cursor });
+    cursor = stop;
+  }
+  return out;
+}
+
+/** 周一=0 … 周日=6，getDay() 的偏移只在这里处理一次。 */
+const weekdayIndex = (ts: number): number => (new Date(ts).getDay() + 6) % 7;
+
+/** "YYYY-MM-DD" → 本地正午的时间戳，避开 UTC 解析和夏令时边界。 */
+const dayKeyToNoon = (key: string): number => {
+  const [y, m, d] = key.split("-").map(Number);
+  return new Date(y, m - 1, d, 12).getTime();
+};
 
 const longestWorkMs = (segments: SessionSegment[], now: number, session: StudySession): number =>
   workSpans(segments, now, session.endAt ?? null).reduce((max, s) => Math.max(max, s.end - s.start), 0);
@@ -210,8 +242,13 @@ export interface Stats {
   /** 窗口内已经过去的天数，日均用它，避免拿未来的天数摊薄。 */
   elapsedDays: number;
   activeDays: number;
+  /** 有记录的自然日，连续天数由它算 */
+  activeDayKeys: string[];
   avgPerDay: number;
   sessions: number;
+  /** 计时器记录数 / 补录数：补录占比高说明时长可信度低 */
+  timerSessions: number;
+  backfillSessions: number;
   breakMinutes: number;
   breakCount: number;
   longestWorkMinutes: number;
@@ -226,6 +263,12 @@ export interface Stats {
   pauseReasons: PauseStat[];
   /** 暂停发生的时机分布 */
   focusBuckets: Array<{ label: string; count: number }>;
+  /** 0-23 点，各小时的净学习分钟，用于找「几点最容易进入状态」 */
+  hourHistogram: number[];
+  /** 周一=0 … 周日=6 的净学习分钟 */
+  weekdayMinutes: number[];
+  /** 窗口内每个星期几实际出现过几天，用于把 weekdayMinutes 折成「平均每个周六」 */
+  weekdayCounts: number[];
   perPerson: PersonStat[];
 }
 
@@ -263,6 +306,8 @@ export function aggregate(input: AggregateInput): Stats {
   const pauseTotal = new Map<string, { ms: number; count: number }>();
   const personStat = new Map<string, PersonStat>();
   const depths: number[] = [];
+  const hourHistogram = new Array<number>(24).fill(0);
+  const weekdayMinutes = new Array<number>(7).fill(0);
 
   let totalMinutes = 0;
   let breakMinutes = 0;
@@ -271,6 +316,8 @@ export function aggregate(input: AggregateInput): Stats {
   let plannedMinutes = 0;
   let plannedAchievedMinutes = 0;
   let counted = 0;
+  let timerSessions = 0;
+  let backfillSessions = 0;
 
   const bump = (store: Map<string, Map<string, number>>, key: string, day: string, ms: number) => {
     const inner = store.get(key) ?? new Map<string, number>();
@@ -290,7 +337,19 @@ export function aggregate(input: AggregateInput): Stats {
     if (windowMs <= 0) continue;
 
     counted += 1;
+    if (session.source === "backfill") backfillSessions += 1;
+    else timerSessions += 1;
     totalMinutes += windowMs / MINUTE;
+
+    for (const span of attributedSpans(session, segments, range, now)) {
+      for (const h of splitByHour(span.start, span.end)) {
+        hourHistogram[h.hour] += h.ms / MINUTE;
+      }
+    }
+    // 星期归属用已按天切分的结果，跨零点的段才不会整段算给前一天
+    for (const a of attributed) {
+      weekdayMinutes[weekdayIndex(dayKeyToNoon(a.day))] += a.ms / MINUTE;
+    }
 
     for (const a of attributed) {
       perDay.set(a.day, (perDay.get(a.day) ?? 0) + a.ms / MINUTE);
@@ -390,8 +449,16 @@ export function aggregate(input: AggregateInput): Stats {
       .map(([key, ms]) => ({ key, ...label(key), minutes: r(ms / MINUTE) }))
       .sort((a, b) => b.minutes - a.minutes);
 
-  const activeDays = [...perDay.values()].filter((m) => m > 0).length;
+  const activeDayKeys = [...perDay.entries()].filter(([, m]) => m > 0).map(([d]) => d).sort();
+  const activeDays = activeDayKeys.length;
   const elapsedDays = elapsedDaysOf(days, now);
+  // 每个星期几在本窗口出现过几次（只数已过去的天）。跨周求和的量和单日
+  // 均值不可比 —— 本月有 5 个周六时，周六的总量天然高于只有 4 个的周三。
+  const weekdayCounts = new Array<number>(7).fill(0);
+  for (const d of days) {
+    if (d > todayKey) break;
+    weekdayCounts[weekdayIndex(dayKeyToNoon(d))] += 1;
+  }
 
   return {
     range,
@@ -399,8 +466,11 @@ export function aggregate(input: AggregateInput): Stats {
     totalMinutes: r(totalMinutes),
     elapsedDays,
     activeDays,
+    activeDayKeys,
     avgPerDay: elapsedDays ? r(totalMinutes / elapsedDays) : 0,
     sessions: counted,
+    timerSessions,
+    backfillSessions,
     breakMinutes: r(breakMinutes),
     breakCount,
     longestWorkMinutes: r(longestWorkMinutes),
@@ -429,8 +499,25 @@ export function aggregate(input: AggregateInput): Stats {
         count: depths.filter((d) => (i === BUCKET_LABELS.length - 1 ? d >= lower : d >= lower && d < upper)).length,
       };
     }),
+    hourHistogram: hourHistogram.map(r),
+    weekdayMinutes: weekdayMinutes.map(r),
+    weekdayCounts,
     perPerson: [...personStat.values()].sort((a, b) => b.minutes - a.minutes),
   };
+}
+
+/** 连续记录天数。从今天或昨天往前数，中断即停 —— 断签的挫败感是留存杀手。 */
+export function streakDays(activeDayKeys: string[], now: number): number {
+  const set = new Set(activeDayKeys);
+  let cursor = midnight(now);
+  // 今天还没记不算断签，从昨天开始数
+  if (!set.has(dayKey(cursor))) cursor = addDays(cursor, -1);
+  let count = 0;
+  while (set.has(dayKey(cursor))) {
+    count += 1;
+    cursor = addDays(cursor, -1);
+  }
+  return count;
 }
 
 /** 环比：正数为增长。上期为 0 时返回 null，避免「+∞%」这种没意义的数字。 */
