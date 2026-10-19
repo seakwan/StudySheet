@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, lazy, Suspense, useState } from "react";
 import { useLiveQuery } from "dexie-react-hooks";
 import { db } from "./db";
 import { useTimer } from "./state/timer";
@@ -9,7 +9,12 @@ import { TodayList } from "./components/TodayList";
 import { BackfillPanel } from "./components/BackfillPanel";
 import { DictionaryPanel } from "./components/DictionaryPanel";
 
-type Tab = "record" | "settings";
+// ECharts 体积大，只有进「图表」页才加载，别拖慢每天必开的主界面
+const StatsPanel = lazy(() =>
+  import("./components/StatsPanel").then((m) => ({ default: m.StatsPanel })),
+);
+
+type Tab = "record" | "stats" | "settings";
 
 export default function App() {
   const boot = useTimer((s) => s.boot);
@@ -33,13 +38,22 @@ export default function App() {
           <TabButton active={tab === "record"} onClick={() => setTab("record")}>
             记录
           </TabButton>
+          <TabButton active={tab === "stats"} onClick={() => setTab("stats")}>
+            图表
+          </TabButton>
           <TabButton active={tab === "settings"} onClick={() => setTab("settings")}>
-            科目设置
+            设置
           </TabButton>
         </nav>
       </header>
 
-      {tab === "record" ? (
+      {tab === "stats" && (
+        <Suspense fallback={<p className="rounded-2xl bg-white p-4 text-sm text-slate-400 shadow-sm">图表载入中…</p>}>
+          <StatsPanel />
+        </Suspense>
+      )}
+
+      {tab === "record" && (
         <div className="space-y-3">
           <ProfileSwitcher />
           {profileCount === 0 ? (
@@ -55,11 +69,13 @@ export default function App() {
             </>
           )}
         </div>
-      ) : (
+      )}
+
+      {tab === "settings" && (
         <div className="space-y-3">
           <DictionaryPanel />
           <p className="px-1 text-xs leading-relaxed text-slate-400">
-            所有数据都存在这台设备的浏览器里。M2 会在这里加「本周」视图（按科目、按事项的时长曲线和暂停原因统计），M3 加周报。
+            所有数据都存在这台设备的浏览器里，不上传服务器。M3 计划在「图表」页上叠加每周自动分析与改进建议。
           </p>
         </div>
       )}
