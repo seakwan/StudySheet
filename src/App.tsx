@@ -75,7 +75,8 @@ export default function App() {
         <div className="space-y-3">
           <DictionaryPanel />
           <p className="px-1 text-xs leading-relaxed text-slate-400">
-            所有数据都存在这台设备的浏览器里，不上传服务器。M3 计划在「图表」页上叠加每周自动分析与改进建议。
+            所有数据都存在这台设备的浏览器里，不上传服务器。每周分析在「图表」页顶部，
+            结论由本机规则算出，不经过任何模型或服务器。
           </p>
         </div>
       )}

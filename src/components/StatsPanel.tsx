@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { Chart, AXIS, type ChartOption } from "./Chart";
+import { ReportPanel } from "./ReportPanel";
 import { useStats, type Scope } from "../hooks/useStats";
 import { useDayAnchor } from "../hooks/useNow";
 import type { RangeMode } from "../lib/stats";
@@ -74,9 +75,21 @@ export function StatsPanel() {
         <Summary current={current} change={change} mode={mode} />
       </section>
 
+      {/* 先给结论再给图：用户多半只读这一段，图是用来核对结论的。
+          对比模式下不出一份报告 —— 把几个人的数据混在一起说「你偏科」是错的。 */}
+      {scope.kind !== "compare" && (
+        <ReportPanel
+          current={current}
+          previous={previous}
+          mode={mode}
+          anchor={anchor}
+          scopeLabel={scope.kind === "one" ? profiles.find((p) => p.id === scope.profileId)?.name ?? "已归档" : "全员"}
+        />
+      )}
+
       {current.totalMinutes === 0 ? (
         <p className="rounded-2xl bg-white p-6 text-center text-sm text-slate-400 shadow-sm">
-          这个时段还没有记录
+          {current.sessions > 0 ? "记录不足 1 分钟，图上还看不出东西" : "这个时段还没有记录"}
         </p>
       ) : (
         <>
