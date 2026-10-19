@@ -56,7 +56,16 @@ export const useTimer = create<TimerStore>((set, get) => {
     boot: async () => {
       const session = await db.sessions.where("status").anyOf("running", "paused").first();
       if (!session) {
-        set({ ready: true, session: null, segments: [] });
+        // 导入替换全库后，原先选中的人可能已经不存在了。留着它会把新记录
+        // 记到一个查无此人的 id 上，所以重新校验一次。
+        const selected = get().profile;
+        const stillThere = selected ? await db.profiles.get(selected.id) : undefined;
+        set({
+          ready: true,
+          session: null,
+          segments: [],
+          profile: stillThere && !stillThere.archived ? selected : null,
+        });
         return;
       }
       const [segments, profile] = await Promise.all([
