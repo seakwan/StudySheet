@@ -9,6 +9,7 @@ import { TodayList } from "./components/TodayList";
 import { BackfillPanel } from "./components/BackfillPanel";
 import { DictionaryPanel } from "./components/DictionaryPanel";
 import { BackupPanel } from "./components/BackupPanel";
+import { BackupNudge } from "./components/BackupNudge";
 
 // ECharts 体积大，只有进「图表」页才加载，别拖慢每天必开的主界面
 const StatsPanel = lazy(() =>
@@ -63,6 +64,7 @@ export default function App() {
             </p>
           ) : (
             <>
+              <BackupNudge onGoSettings={() => setTab("settings")} />
               <TimerCard />
               <StartPanel />
               <BackfillPanel />
@@ -78,8 +80,8 @@ export default function App() {
           <DictionaryPanel />
           <p className="px-1 text-xs leading-relaxed text-slate-400">
             所有数据都存在这台设备的浏览器里，不上传服务器 —— 所以换设备或清缓存前，
-            请先用上面的「导出备份」。每周分析在「图表」页顶部，结论由本机规则算出，
-            不经过任何模型或服务器。
+            请先用上面的「把备份发出去」或「存成文件」。每周分析在「图表」页顶部，
+            结论由本机规则算出，不经过任何模型或服务器。
           </p>
         </div>
       )}

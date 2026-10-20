@@ -2,6 +2,10 @@ import type { SessionSegment } from "../db/types";
 
 export const MINUTE = 60_000;
 
+export const HOUR = 60 * MINUTE;
+
+export const DAY = 24 * HOUR;
+
 /**
  * 净学习时长 = Σ work 段。now 用于运行中的会话：最后一段没有 endAt 时按当前时刻算，
  * 所以计时器每次渲染只要传 Date.now() 进来，不依赖 setInterval 累加。

@@ -11,6 +11,8 @@ import {
   type Backup,
 } from "../lib/export";
 import { importBackup, previewImport, type ImportMode, type ImportResult } from "../lib/merge";
+import { channelLabel, parsePasted, sendBackup } from "../lib/share";
+import { MIGRATION_STEPS, backupStatus, readMark, writeMark, type ExportMark } from "../lib/sync";
 import { useTimer } from "../state/timer";
 
 interface Pending {
@@ -20,29 +22,47 @@ interface Pending {
   summary: string;
 }
 
-/** 备份与导出。数据只在本机浏览器里，不换出去就等于没有。 */
+/** 备份、导出、跨设备搬运。数据只在本机浏览器里，不换出去就等于没有。 */
 export function BackupPanel() {
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [pending, setPending] = useState<Pending | null>(null);
+  const [pasteOpen, setPasteOpen] = useState(false);
+  const [pasteText, setPasteText] = useState("");
   const fileRef = useRef<HTMLInputElement>(null);
   const boot = useTimer((s) => s.boot);
 
-  const counts = useLiveQuery(async () => ({ sessions: await db.sessions.count(), profiles: await db.profiles.count() }), []);
+  const counts = useLiveQuery(
+    async () => ({ sessions: await db.sessions.count(), profiles: await db.profiles.count() }),
+    [],
+  );
+  // 上次导出的凭据存在 localStorage，不是响应式的，所以进 state 自己维护一份
+  const [mark, setMark] = useState<ExportMark | null>(() => readMark());
+  const status = counts ? backupStatus(mark, counts, Date.now()) : null;
+
+  const collect = async () => {
+    const [profiles, subjects, taskTypes, pauseReasons, sessions, segments] = await Promise.all([
+      db.profiles.toArray(),
+      db.subjects.toArray(),
+      db.taskTypes.toArray(),
+      db.pauseReasons.toArray(),
+      db.sessions.toArray(),
+      db.segments.toArray(),
+    ]);
+    return { profiles, subjects, taskTypes, pauseReasons, sessions, segments, now: Date.now() };
+  };
+
+  const exported = (count: number) => {
+    const next = { at: Date.now(), sessions: count };
+    writeMark(next);
+    setMark(next);
+  };
 
   const download = async (kind: "csv" | "json") => {
     setBusy(true);
     setMessage(null);
     try {
-      const [profiles, subjects, taskTypes, pauseReasons, sessions, segments] = await Promise.all([
-        db.profiles.toArray(),
-        db.subjects.toArray(),
-        db.taskTypes.toArray(),
-        db.pauseReasons.toArray(),
-        db.sessions.toArray(),
-        db.segments.toArray(),
-      ]);
-      const data = { profiles, subjects, taskTypes, pauseReasons, sessions, segments, now: Date.now() };
+      const data = await collect();
       const text = kind === "csv" ? buildCsv(data) : serializeBackup(buildBackup(data));
       saveBlob(
         new Blob([text], {
@@ -50,6 +70,7 @@ export function BackupPanel() {
         }),
         exportFilename(kind),
       );
+      if (kind === "json") exported(data.sessions.length);
       setMessage(`已生成 ${exportFilename(kind)}`);
     } catch (e) {
       setMessage(e instanceof Error ? e.message : "导出失败");
@@ -58,21 +79,63 @@ export function BackupPanel() {
     }
   };
 
+  /** 分享 → 剪贴板 → 文件，sendBackup 里挑第一条能走的。 */
+  const send = async () => {
+    setBusy(true);
+    setMessage(null);
+    try {
+      const data = await collect();
+      const filename = exportFilename("json");
+      const res = await sendBackup(serializeBackup(buildBackup(data)), {
+        filename,
+        canShareFile: (file) =>
+          typeof navigator !== "undefined" &&
+          typeof navigator.canShare === "function" &&
+          navigator.canShare({ files: [file] }),
+        share: (payload) => navigator.share(payload),
+        clipboardWrite: async (text) => {
+          await navigator.clipboard.writeText(text);
+        },
+        download: (blob, name) => saveBlob(blob, name),
+      });
+      exported(data.sessions.length);
+      setMessage(res.note ?? channelLabel(res.channel));
+    } catch (e) {
+      setMessage(e instanceof Error ? e.message : "发送失败");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const stage = async (backup: Backup) => {
+    setPending({
+      backup,
+      merge: await previewImport(backup, "merge"),
+      replace: await previewImport(backup, "replace"),
+      summary: describeBackup(backup),
+    });
+  };
+
   const onPicked = async (file: File | undefined) => {
     if (!file) return;
     setMessage(null);
     try {
-      const backup = parseBackup(await file.text());
-      setPending({
-        backup,
-        merge: await previewImport(backup, "merge"),
-        replace: await previewImport(backup, "replace"),
-        summary: describeBackup(backup),
-      });
+      await stage(parseBackup(await file.text()));
     } catch (e) {
       setMessage(e instanceof Error ? e.message : "读取文件失败");
     } finally {
       if (fileRef.current) fileRef.current.value = "";
+    }
+  };
+
+  const onPaste = async () => {
+    setMessage(null);
+    try {
+      await stage(parsePasted(pasteText));
+      setPasteOpen(false);
+      setPasteText("");
+    } catch (e) {
+      setMessage(e instanceof Error ? e.message : "解析失败");
     }
   };
 
@@ -83,6 +146,8 @@ export function BackupPanel() {
       const res: ImportResult = await importBackup(pending.backup, mode);
       // 替换导入可能把正在计时的会话换掉，store 必须重新对齐
       await boot();
+      // 数据刚刚从一个文件里进来，等于已经有一份在别处了，不该再催「从没备份过」
+      exported(await db.sessions.count());
       setPending(null);
       setMessage(
         `已导入：新增 ${res.added} 条` +
@@ -100,38 +165,70 @@ export function BackupPanel() {
 
   return (
     <section className="rounded-2xl bg-white p-4 shadow-sm">
-      <h2 className="mb-1 text-sm font-semibold text-slate-500">备份与导出</h2>
-      <p className="mb-3 text-xs leading-relaxed text-slate-400">
+      <h2 className="mb-1 text-sm font-semibold text-slate-500">备份与换设备</h2>
+      <p className="text-xs leading-relaxed text-slate-400">
         {counts ? `本机现有 ${counts.sessions} 条记录 / ${counts.profiles} 人。` : "统计中…"}
         数据只存在这台设备的浏览器里，清缓存或换设备前请先导出。
       </p>
-
-      <div className="flex gap-2">
-        <button
-          onClick={() => void download("csv")}
-          disabled={busy}
-          className="flex-1 rounded-xl border border-slate-200 py-2.5 text-sm text-slate-600 disabled:opacity-50"
+      {status && (
+        <p
+          className={
+            "mt-1.5 rounded-lg px-2 py-1.5 text-xs leading-relaxed " +
+            (status.level === "bad"
+              ? "bg-red-50 text-red-600"
+              : status.level === "warn"
+                ? "bg-amber-50 text-amber-700"
+                : "text-slate-400")
+          }
         >
-          导出 CSV
+          {status.text}
+        </p>
+      )}
+
+      <div className="mt-3 flex gap-2">
+        <button
+          onClick={() => void send()}
+          disabled={busy}
+          className="flex-1 rounded-xl bg-slate-900 py-2.5 text-sm font-semibold text-white disabled:opacity-50"
+        >
+          把备份发出去
         </button>
         <button
           onClick={() => void download("json")}
           disabled={busy}
-          className="flex-1 rounded-xl bg-slate-900 py-2.5 text-sm font-semibold text-white disabled:opacity-50"
+          className="flex-1 rounded-xl border border-slate-200 py-2.5 text-sm text-slate-600 disabled:opacity-50"
         >
-          导出备份
+          存成文件
+        </button>
+        <button
+          onClick={() => void download("csv")}
+          disabled={busy}
+          className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm text-slate-600 disabled:opacity-50"
+        >
+          CSV
         </button>
       </div>
-      <p className="mt-1.5 text-[11px] text-slate-400">CSV 给 Excel / Numbers 看；备份 JSON 能原样导回，换设备用它。</p>
+      <p className="mt-1.5 text-[11px] leading-relaxed text-slate-400">
+        「发出去」会优先调系统分享（微信 / 隔空投送 / 文件），不支持时退回复制，再不行才存文件。
+        CSV 给 Excel 看，不能导回。
+      </p>
 
       {!pending ? (
-        <button
-          onClick={() => fileRef.current?.click()}
-          disabled={busy}
-          className="mt-4 w-full rounded-xl border border-dashed border-slate-300 py-2.5 text-sm text-slate-500 disabled:opacity-50"
-        >
-          从备份文件导入
-        </button>
+        <div className="mt-4 flex gap-2">
+          <button
+            onClick={() => fileRef.current?.click()}
+            disabled={busy}
+            className="flex-1 rounded-xl border border-dashed border-slate-300 py-2.5 text-sm text-slate-500 disabled:opacity-50"
+          >
+            导入备份文件
+          </button>
+          <button
+            onClick={() => setPasteOpen((v) => !v)}
+            className="rounded-xl border border-dashed border-slate-300 px-3 py-2.5 text-sm text-slate-500"
+          >
+            粘贴导入
+          </button>
+        </div>
       ) : (
         <div className="mt-4 rounded-xl bg-slate-50 p-3">
           <p className="text-xs font-medium text-slate-600">{pending.summary}</p>
@@ -159,9 +256,43 @@ export function BackupPanel() {
         </div>
       )}
 
-      <input ref={fileRef} type="file" accept="application/json,.json" className="hidden" onChange={(e) => void onPicked(e.target.files?.[0])} />
+      {pasteOpen && !pending && (
+        <div className="mt-2">
+          <textarea
+            value={pasteText}
+            onChange={(e) => setPasteText(e.target.value)}
+            placeholder="把另一台设备复制的备份内容粘贴到这里"
+            rows={3}
+            className="w-full rounded-xl border border-slate-200 p-2 text-xs outline-none focus:border-slate-400"
+          />
+          <button
+            onClick={() => void onPaste()}
+            disabled={busy || !pasteText.trim()}
+            className="mt-1.5 w-full rounded-lg border border-slate-200 py-2 text-sm text-slate-600 disabled:opacity-40"
+          >
+            解析这段内容
+          </button>
+        </div>
+      )}
+
+      <input
+        ref={fileRef}
+        type="file"
+        accept="application/json,.json"
+        className="hidden"
+        onChange={(e) => void onPicked(e.target.files?.[0])}
+      />
 
       {message && <p className="mt-2 rounded-lg bg-slate-50 px-2 py-1.5 text-xs text-slate-600">{message}</p>}
+
+      <details className="mt-3">
+        <summary className="cursor-pointer text-[11px] text-slate-400">换到新设备怎么做</summary>
+        <ol className="mt-1.5 list-decimal space-y-1 pl-4 text-[11px] leading-relaxed text-slate-500">
+          {MIGRATION_STEPS.map((step) => (
+            <li key={step}>{step}</li>
+          ))}
+        </ol>
+      </details>
     </section>
   );
 }
